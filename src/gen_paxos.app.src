@@ -1,0 +1,11 @@
+{application, gen_paxos,
+ [
+  {description, "Generic Paxos implementation"},
+  {vsn, "0.0.1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {env, []}
+ ]}.
