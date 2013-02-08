@@ -13,16 +13,48 @@
 % gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
-% state record used by '$cons' protocols
--record(cons_st, {name, ballot, max_pair, nodes}).
+% behaviour definition
+-export([behaviour_info/1]).
 
-init({Name, Nodes}) ->
+% API functions
+-export([start/4, start_link/4, atomic_broadcast/2]).
+
+% state record used by '$cons' protocols
+-record(cons_st, {name, mod, ballot, max_pair, nodes, user_state, call_map, active}).
+
+%%%% public APIs
+
+start(Name, Mod, Args, Nodes) ->
+    gen_server:start({local, Name}, ?MODULE, {Name, Mod, Args, Nodes}, []).
+
+start_link(Name, Mod, Args, Nodes) ->
+    gen_server:start_link({local, Name}, ?MODULE, {Name, Mod, Args, Nodes}, []).
+
+atomic_broadcast(Name, Message) ->
+    gen_server:call(Name, {'$cons_propose', Message}).
+
+%%%% gen_server callbacks
+
+init({Name, Mod, Args, Nodes}) ->
     case lists:member(node(), Nodes) of
         false ->
             {stop, i_am_not_a_member};
         true ->
-            ConsST = #cons_st{ballot = 0, max_pair = {-1, undefined}, name = Name, nodes = lists:usort(Nodes)},
-            {ok, ConsST}
+            case Mod:init(Args) of
+                {ok, State} ->
+                    ConsST = #cons_st{
+                                    name = Name,
+                                    mod = Mod,
+                                    ballot = 0,
+                                    max_pair = {-1, undefined},
+                                    nodes = lists:usort(Nodes),
+                                    user_state = State,
+                                    call_map = gb_trees:empty(),
+                                    active = true},
+                    {ok, ConsST};
+                {stop, Reason} ->
+                    {stop, Reason}
+            end
     end.
 
 scout(Parent, Phase, Name, Nodes, B, Message) ->
@@ -33,81 +65,108 @@ scout(Parent, Phase, Name, Nodes, B, Message) ->
             lists:foreach(fun(N) -> erlang:send({Name, N}, {'$cons_accept', self(), B, Message}) end, Nodes)
     end,
     NodeSet = gb_sets:from_list(Nodes),
-    scout_loop(Parent, Phase, NodeSet, B, Message, gb_sets:size(NodeSet), 0, 0).
+    scout_loop(Parent, Phase, NodeSet, B, gb_sets:size(NodeSet), 0).
 
-scout_loop(Parent, Phase, NodeSet, B, Message, Size, Ack, Ign) ->
+scout_loop(Parent, Phase, NodeSet, B, Size, Ack) ->
     receive
-        {'$commander_ack', Accepted, Node, B} ->
+        {'$cons_ack', Node, {B, ThisNode}} when ThisNode == node() ->
             case gb_sets:is_member(Node, NodeSet) of
                 true ->
-                    {NAck, NIgn} = 
-                    if
-                        Accepted ->
-                            {Ack+1, Ign};
-                        true ->
-                            {Ack, Ign+1}
-                    end,
                     NewSet = gb_sets:delete(Node, NodeSet),
+                    NAck = Ack+1,
                     if
                         Size < NAck*2 ->
-                            erlang:send(Parent, {'$scout_accepted', Phase, B, Message});
-                        Size < NIgn*2 ->
-                            erlang:send(Parent, {'$scout_rejected', Phase, B, Message});
+                            erlang:send(Parent, {'$scout_accepted', Phase, B});
                         true ->
-                            scout_loop(Parent, Phase, NewSet, B, Message, Size, NAck, NIgn)
+                            scout_loop(Parent, Phase, NewSet, B, Size, NAck)
                     end;
                 false ->
-                    scout_loop(Parent, Phase, NodeSet, B, Message, Size, Ack, Ign)
+                    scout_loop(Parent, Phase, NodeSet, B, Size, Ack)
             end;
+        {'$cons_ack', _Node, OtherPair} ->
+            % an acceptor is preempted by higher ballot
+            erlang:send(Parent, {'$scout_preempted', Phase, B, OtherPair});
         _Ignore ->
-            scout_loop(Parent, Phase, NodeSet, B, Message, Size, Ack, Ign)
+            scout_loop(Parent, Phase, NodeSet, B, Size, Ack)
     end.
-
-handle_call(_Message, _From, ConsST) ->
-    {reply, {error, unknown_message}, ConsST}.
 
 handle_cast(_Message, ConsST) ->
     {noreply, ConsST}.
 
 % phase 1a
-handle_info({'$cons_propose', Message}, ConsST = #cons_st{ballot = B}) ->
-    Self = self(),
-    spawn(fun() -> scout(Self, prepare, ConsST#cons_st.name, ConsST#cons_st.nodes, B, Message) end),
-    {noreply, ConsST#cons_st{ballot = B+1}};
+handle_call({'$cons_propose', Message}, From, ConsST = #cons_st{ballot = B, call_map = CallMap}) ->
+    Parent = self(),
+    spawn_link(fun() -> scout(Parent, prepare, ConsST#cons_st.name, ConsST#cons_st.nodes, B, Message) end),
+    NewST = ConsST#cons_st{ballot = B+1, call_map = gb_trees:insert(B, {From, Message}, CallMap)},
+    {noreply, NewST};
+
+handle_call(_Message, _From, ConsST) ->
+    {reply, {error, unknown_message}, ConsST}.
 
 % phase 1b
 handle_info({'$cons_prepare', Scout, B}, ConsST = #cons_st{max_pair = MaxPair}) ->
+    {MaxB, MaxLeader} = MaxPair,
     Pair = {B, node(Scout)},
     if
-        Pair < MaxPair ->
-            erlang:send(Scout, {'$cons_ack', false, node(), B}),
+        B < MaxB; B == MaxB, node(Scout) > MaxLeader ->
+            erlang:send(Scout, {'$cons_ack', node(), MaxPair}),
             {noreply, ConsST};
         true ->
-            erlang:send(Scout, {'$cons_ack', true, node(), B}),
+            erlang:send(Scout, {'$cons_ack', node(), Pair}),
             {noreply, ConsST#cons_st{max_pair = Pair}}
     end;
 
 % phase 2a - proposal accepted
-handle_info({'$scout_accepted', B, Message}, ConsST = #cons_st{}) ->
-    Self = self(),
-    spawn(fun() -> scout(Self, accept, ConsST#cons_st.name, ConsST#cons_st.nodes, B, Message) end),
-    {noreply, ConsST};
+handle_info({'$scout_accepted', prepare, B}, ConsST = #cons_st{call_map = CallMap}) ->
+    case gb_trees:lookup(B, CallMap) of
+        {value, {_From, Message}} ->
+            Parent = self(),
+            spawn_link(fun() -> scout(Parent, accept, ConsST#cons_st.name, ConsST#cons_st.nodes, B, Message) end);
+        none ->
+            ok
+    end,
+    {noreply, ConsST#cons_st{active = true}};
+handle_info({'$scout_accepted', accept, B}, ConsST = #cons_st{call_map = CallMap}) ->
+    case gb_trees:lookup(B, CallMap) of
+        {value, {From, _Message}} ->
+            gen_server:reply(From, ok),
+            NewST = ConsST#cons_st{call_map = gb_trees:delete(B, CallMap)},
+            {noreply, NewST};
+        none ->
+            {noreply, ConsST}
+    end;
 % phase 2a - proposal rejected
-handle_info({'$scout_rejected', B, Message}, ConsST = #cons_st{}) ->
-    {noreply, ConsST};
+handle_info({'$scout_preempted', _Phase, B, {MaxB, _Leader}}, ConsST = #cons_st{call_map = CallMap}) ->
+    PreemptedST = ConsST#cons_st{ballot = MaxB+1, active = false},
+    case gb_trees:lookup(B, CallMap) of
+        {value, {From, _Message}} ->
+            gen_server:reply(From, preempted),
+            {noreply, PreemptedST#cons_st{call_map = gb_trees:delete(B, CallMap)}};
+        none ->
+            {noreply, PreemptedST}
+    end;
 
 % phase 2b
 handle_info({'$cons_accept', Commander, B, Message}, ConsST = #cons_st{max_pair = MaxPair}) ->
+    {MaxB, MaxLeader} = MaxPair,
     Pair = {B, node(Commander)},
     if
-        Pair < MaxPair ->
+        B < MaxB; B == MaxB, node(Commander) > MaxLeader ->
             % reject this ballot
-            erlang:send(Commander, {'$cons_ack', false, node(), B}),
+            erlang:send(Commander, {'$cons_ack', node(), MaxPair}),
             {noreply, ConsST};
         true ->
+            Mod = ConsST#cons_st.mod,
+            UserST = ConsST#cons_st.user_state,
+
             % register this message
-            erlang:send(Commander, {'$cons_ack', true, node(), B}),
-            {noreply, ConsST#cons_st{max_pair = Pair}}
+            erlang:send(Commander, {'$cons_ack', node(), Pair}),
+            case Mod:handle_message(Message, UserST) of
+                {ok, NewUserST} ->
+                    {noreply, ConsST#cons_st{max_pair = Pair, user_state = NewUserST}};
+                {stop, Reason} ->
+                    {stop, Reason, ConsST}
+            end
     end;
 
 handle_info(_Message, ConsST) ->
@@ -118,3 +177,10 @@ terminate(_Reason, _ConsST) ->
 
 code_change(_OldVsn, ConsST, _Extra) ->
     {ok, ConsST}.
+
+%%%% behaviour info
+
+behaviour_info(callbacks) ->
+    [{init, 1}, {handle_message, 2}];
+behaviour_info(_Type) ->
+    undefined.
